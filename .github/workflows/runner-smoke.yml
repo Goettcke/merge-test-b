@@ -1,0 +1,43 @@
+name: Runner smoke test
+run-name: Runner smoke test (${{ inputs.outcome }})
+
+# Manual only: this does not run code from incoming pull requests.
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds to occupy the runner (0 to 600)
+        type: number
+        default: 30
+        required: true
+      outcome:
+        description: Test outcome (random fails 20 percent of the time)
+        type: choice
+        options: [pass, fail, random]
+        default: pass
+        required: true
+
+permissions: {}
+
+jobs:
+  smoke:
+    runs-on: self-hosted
+    timeout-minutes: 15
+    steps:
+      - name: Occupy runner and report result
+        shell: bash
+        env:
+          SECONDS_INPUT: ${{ inputs.seconds }}
+          OUTCOME: ${{ inputs.outcome }}
+        run: |
+          python3 -u - <<'PY'
+          import os, random, socket, time
+          seconds = int(os.environ['SECONDS_INPUT'])
+          outcome = os.environ['OUTCOME']
+          if not 0 <= seconds <= 600 or outcome not in ('pass', 'fail', 'random'):
+              raise SystemExit('Invalid smoke test controls')
+          failed = outcome == 'fail' or (outcome == 'random' and random.randrange(100) < 20)
+          print(f'Runner host: {socket.gethostname()}; sleep: {seconds}s; result: {"fail" if failed else "pass"}')
+          time.sleep(seconds)
+          raise SystemExit(1 if failed else 0)
+          PY

@@ -1,0 +1,117 @@
+name: Fake merge candidate validation
+run-name: Merge orchestrator ${{ inputs.attempt_id }}
+
+# The App dispatches the trusted workflow on main. Candidate content is read as
+# data only; no scripts from the candidate are executed.
+on:
+  workflow_dispatch:
+    inputs:
+      attempt_id:
+        required: true
+        type: string
+      head_sha:
+        required: true
+        type: string
+      base_sha:
+        required: true
+        type: string
+      candidate_sha:
+        required: true
+        type: string
+      workflow_sha:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: merge-candidate-${{ inputs.attempt_id }}
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    name: Fake candidate suite
+    runs-on: self-hosted
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify identity and read test controls
+        shell: bash
+        env:
+          ATTEMPT_ID: ${{ inputs.attempt_id }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          EXPECTED_WORKFLOW_SHA: ${{ inputs.workflow_sha }}
+          ACTUAL_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          from pathlib import Path
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          attempt = os.environ['ATTEMPT_ID']
+          if not re.fullmatch(r'[a-f0-9-]{36}', attempt):
+              raise SystemExit('Invalid attempt ID')
+          proof = {'attempt_id': attempt}
+          for key in ('head_sha', 'base_sha', 'candidate_sha', 'workflow_sha'):
+              value = os.environ['EXPECTED_WORKFLOW_SHA' if key == 'workflow_sha' else key.upper()]
+              if not re.fullmatch(r'[a-f0-9]{40}', value):
+                  raise SystemExit(f'Invalid {key}')
+              proof[key] = value
+          if os.environ['ACTUAL_WORKFLOW_SHA'] != proof['workflow_sha']:
+              raise SystemExit('Workflow version mismatch')
+          if git('rev-parse', 'HEAD') != proof['candidate_sha']:
+              raise SystemExit('Candidate checkout mismatch')
+          parents = [line[7:] for line in git('cat-file', '-p', 'HEAD').split('\n\n', 1)[0].splitlines() if line.startswith('parent ')]
+          if parents != [proof['base_sha'], proof['head_sha']]:
+              raise SystemExit('Candidate parents mismatch')
+          # Read the Git blob instead of following a candidate-controlled symlink.
+          if int(git('cat-file', '-s', 'HEAD:.merge-test.json')) > 4096:
+              raise SystemExit('Test controls exceed 4096 bytes')
+          controls = json.loads(git('show', 'HEAD:.merge-test.json'))
+          if not isinstance(controls, dict) or controls.get('outcome') not in ('pass', 'fail', 'random'):
+              raise SystemExit('Invalid test outcome')
+          for key, maximum in (('minSeconds', 600), ('maxSeconds', 600), ('failPercent', 100)):
+              value = controls.get(key)
+              if type(value) is not int or not 0 <= value <= maximum:
+                  raise SystemExit(f'Invalid {key}')
+          if controls['minSeconds'] > controls['maxSeconds']:
+              raise SystemExit('Invalid sleep range')
+          directory = Path(os.environ['RUNNER_TEMP']) / ('merge-evidence-' + attempt)
+          directory.mkdir(exist_ok=True)
+          (directory / 'candidate.json').write_text(json.dumps(proof))
+          (directory / 'controls.json').write_text(json.dumps(controls))
+          PY
+
+      - name: Simulate candidate tests
+        shell: bash
+        env:
+          ATTEMPT_ID: ${{ inputs.attempt_id }}
+        run: |
+          python3 -u - <<'PY'
+          import json, os, random, time
+          from pathlib import Path
+          directory = Path(os.environ['RUNNER_TEMP']) / ('merge-evidence-' + os.environ['ATTEMPT_ID'])
+          controls = json.loads((directory / 'controls.json').read_text())
+          seconds = random.randint(controls['minSeconds'], controls['maxSeconds'])
+          failed = controls['outcome'] == 'fail' or (controls['outcome'] == 'random' and random.randrange(100) < controls['failPercent'])
+          print(f'Attempt: {os.environ["ATTEMPT_ID"]}; sleep: {seconds}s; result: {"fail" if failed else "pass"}')
+          time.sleep(seconds)
+          raise SystemExit(1 if failed else 0)
+          PY
+
+      - name: Upload candidate evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: merge-evidence-${{ inputs.attempt_id }}
+          path: ${{ runner.temp }}/merge-evidence-${{ inputs.attempt_id }}/candidate.json
+          retention-days: 7
+          if-no-files-found: error
