@@ -1,6 +1,6 @@
 {
   "outcome": "pass",
-  "minSeconds": 5,
-  "maxSeconds": 5,
+  "minSeconds": 90,
+  "maxSeconds": 90,
   "failPercent": 0
 }
